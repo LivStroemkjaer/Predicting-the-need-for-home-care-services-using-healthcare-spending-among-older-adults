@@ -1,0 +1,1745 @@
+```{r}
+---
+title: "Code for thesis 'Predicting the need for home care services using healthcare spending among older, spousal bereaved adults'"
+author: "Liv Strømkjær"
+format: html
+editor: visual
+---
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval=FALSE)
+```
+```
+
+# Initial steps 
+
+## **Loading library**
+
+```{r}
+library(tidyverse) # Data management
+library(lubridate) # Date handling
+library(MatchIt) # Matching data
+library(halfmoon) # Matching visualization 
+library(Publish) # Table 1
+library(ggplot2) # Visualization
+library(rsample) # Splitting data tool
+library(riskRegression) #Risk predictions
+library(tidymodels) # XGBoost
+library(yardstick) # Tidy characterizations of model performance
+library(finetune) # Fine-tuning
+library(rms) # Logistic regression
+library(xlsx) # Export to Excel
+library(DALEX) # Explanability of models
+library(DALEXtra) # Explanability of models
+library(ingredients) # Feature importances
+library(patchwork) # Plots together 
+library(grid) # Visualization
+library(patchwork) # Plot composition 
+library(shapviz) # Visualization of shapley values
+```
+
+## **Set working directory & importing data and organizing**
+
+```{r}
+# For data security reasons, working directory and access to databases are not reported
+```
+
+## **Load the main data frames**
+
+```{r}
+# Socio-demographics data frames
+# conn is an R object that has the stored data - for security reasons access to conn is NOT reported here
+pop_data <- tbl(conn, 'pop21') |>  collect()
+sumnumber_of_children_data <- tbl(conn, 'number_of_children') %>% collect()
+affluence_index_data <- tbl(conn, 'affluence_index') %>% collect()
+multimorbidity_data <- tbl(conn, 'multimorbidity') %>% collect()
+
+# Healthcare expenditures data frames
+# conn is an R object that has the stored data - for security reasons access to conn is NOT reported here
+costs_residential21_data <- tbl(conn, 'costs_residential21') %>% collect ()
+costs_lmdb21_data <- tbl(conn, 'costs_lmdb21') %>% collect ()
+costs_home_care21_data <- tbl(conn, 'costs_home_care21') %>% collect ()
+costs_hospital_data <- tbl(conn, 'costs_drg') %>% collect ()
+costs_sssy20_data <- tbl(conn, 'costs_sssy20') %>% collect ()
+```
+
+## **Simple overview of data frames**
+
+```{r}
+# Sociodemographics
+head(pop_data) # Population data
+head(number_of_children_data) # Number of children
+head(affluence_index_data) # Affluence index
+head(multimorbidity_data) # Number of multimorbidities
+
+# Expenditures
+"- Available for individuals at least 65 years by 01/01/2011"
+"- Available for weekly periods"
+"- Costs in 1000s per week"
+"- Time corresponds to weeks since 01/01/2011 "
+"- Highly representative of the expenditures in the Danish population"
+
+head(costs_residential21_data) # Residential Care Cost
+head(costs_lmdb21_data) # Precription Drugs Cost
+head(costs_home_care21_data) # Home Care Cost
+head(costs_hospital_data) # DRG-tariffs
+head(costs_sssy20_data) # Health Insurance
+```
+
+# Dataset
+
+## Sociodemographics
+
+```{r}
+# In this section, I will construct the different variables in the sociodemographic data frame
+# Only individuals married at baseline were keept in the sample.
+
+pop_new <- pop_data %>% 
+  select(PERSON_ID, Date_Of_Death = 'DODDATO', Date_Of_Birth = 'FOED_DAG',
+         pop_neImmigration_Type = 'IE_TYPE', Sex = 'KOEN', Emigration_Date =
+           'EMIGRATION_DATE',Bereavement_Date = 'BEREAVEMENT_DATE', Exclude =
+           'EXCLUDE', Civilstatus = "CIVST")|>
+  filter(Exclude == 0, Civilstatus == "G")
+
+# Calculating the proportion of individuals that die before end of 2016
+
+pop_new %>%
+  count(lubridate::year(Date_Of_Death) <= 2011)
+
+# Making sure the dates and sex variables have the right format
+
+pop_new$Date_Of_Death <- strftime(pop_new$Date_Of_Death,format = '%Y-%m-%d')
+
+pop_new$Date_Of_Birth <- strftime(pop_new$Date_Of_Birth,format = '%Y-%m-%d')
+
+pop_new$Bereavement_Date <- strftime(pop_new$Bereavement_Date, format = '%Y-%m-%d')
+
+pop_new$Date_Of_Birth <- as.Date(pop_new$Date_Of_Birth)
+
+pop_new$Date_Of_Death <- as.Date(pop_new$Date_Of_Death)
+
+pop_new$Bereavement_Date <- as.Date(pop_new$Bereavement_Date)
+
+pop_new$Sex <- as.factor(pop_new$Sex)
+
+# Futher analysis (calculating 'age at death', 'age at start' and 'age at bereavement')
+
+int <- lubridate::interval(pop_new$Date_Of_Birth, pop_new$Date_Of_Death)
+
+pop_new$Age_At_Death <- trunc(time_length(int,'year'))
+
+int_bereaved <- lubridate::interval(pop_new$Date_Of_Birth, pop_new$Bereavement_Date)
+
+pop_new$Age_At_Bereavement <- trunc(time_length(int_bereaved,'year'))
+
+int_age <- lubridate::interval(pop_new$Date_Of_Birth,as.Date('2011-01-01'))
+
+pop_new$Age_At_Start <- trunc(time_length(int_age,'year'))
+
+# Excluding individuals who died within a week after spousal bereavement (no information on the need for home care costs as it is achived at a weekly basis) 
+
+int_death_bereavement <- lubridate::interval(pop_new$Bereavement_Date, end = pop_new$Date_Of_Death)
+
+pop_new$Dead_After_Ber <- trunc(time_length(int_death_bereavement, 'day'))
+
+pop_new <- pop_new %>% 
+  filter(Dead_After_Ber > 7 | is.na(Dead_After_Ber))
+
+# Summary of age at bereavement 
+
+summary(pop_new$Age_At_Bereavement)
+
+
+# Categorising age at start of study
+
+pop_new <- pop_new %>% 
+      mutate(Age_Group_Start = case_when(Age_At_Start %in%  65:69 ~ '65-69',
+                                          Age_At_Start %in%  70:74 ~ '70-74',
+                                          Age_At_Start %in%  75:79 ~ '75-79',
+                                          Age_At_Start %in%  80:84 ~ '80-84',
+                                          Age_At_Start %in%  85:120 ~'85+'))
+
+# Categorising age at bereavement
+
+pop_new <- pop_new %>% 
+ mutate(Age_Group_Bereavement = case_when(Age_At_Bereavement %in%  65:69 ~ '65-69',
+                                          Age_At_Bereavement %in%  70:74 ~ '70-74',
+                                          Age_At_Bereavement %in%  75:79 ~ '75-79',
+                                          Age_At_Bereavement %in%  80:84 ~ '80-84',
+                                          Age_At_Bereavement %in%  85:120 ~'85+'))
+
+# Making 'age at start of study' and 'age at bereavement' as factors
+
+pop_new$Age_Group_Start <- as.factor(pop_new$Age_Group_Start)
+
+pop_new$Age_Group_Bereavement <- as.factor(pop_new$Age_Group_Bereavement)
+
+# Excluding individuals bereaved before 2012 (only individuals berevaed within 2012 where considered eligble for "bereavement")
+
+pop_new <- pop_new |> filter(year(Bereavement_Date) >= 2012 | is.na(Bereavement_Date))
+
+# Creating a binary variable (bereaved in year 2012 = 1, otherwise = 0)
+
+pop_new <- pop_new |> mutate(Bereavement_Status = factor(if_else(year(Bereavement_Date) > 2012 | is.na(Bereavement_Date), 0,1)))
+
+summary(pop_new$Bereavement_Status)
+
+# Change sex variable levels to male & female
+
+levels(pop_new$Sex)[levels(pop_new$Sex) == '1'] <- 'Males'
+levels(pop_new$Sex)[levels(pop_new$Sex) == '2'] <- 'Females'
+
+# Additional sociodemographics
+
+# Creating immigration status as a factor variable (NB: immigrants & descendants merged)
+
+pop_new <- pop_new %>% 
+  mutate(Immigration_Status = case_when(Immigration_Type == 1 ~ 'Danish',
+                                        Immigration_Type == 2 | 3 ~ 'Immigrants'))
+                              
+# Now for number of children
+
+# Constructing the number of children data set with the variables needed
+
+children_data <- number_of_children_data %>% 
+  replace_na(list(N_MOTHER = 0, N_FATHER =0)) %>%
+  group_by(PERSON_ID) %>%
+  mutate(Children = sum(N_MOTHER + N_FATHER)) %>%
+  ungroup () %>%
+  select(PERSON_ID, Children)
+
+# Merging number of children into the pop_new data frame
+
+pop_new1 <- pop_new %>%
+  left_join(children_data, by = 'PERSON_ID')
+
+# Replacing NA's with zero
+
+pop_new1 <- pop_new1 %>% replace_na(list(Children = 0))
+
+# Making number of children as a factor variable
+
+pop_new1 <- pop_new1 %>%  
+          mutate(Children_Group = case_when(Children == 0 ~ 'Zero',
+          Children == 1 ~ 'One',
+          Children == 2 ~ 'Two',
+          Children == 3 ~ 'Three',
+          Children >= 4 ~ 'Four or more'))
+
+# Now for affluence index
+
+# Select the quantiles of affluence index
+
+affluence <- affluence_index_data %>% 
+  select(AFFLUENCE_GROUP,PERSON_ID)
+
+# Merging affluence into the pop_new data frame
+
+pop_new2 <- pop_new1 %>% 
+  inner_join(affluence, by = 'PERSON_ID')
+
+
+# Making affluence as a factor variable
+
+pop_new2 <- pop_new2 %>%
+  mutate(Affluence_Group_New = case_when(
+                               AFFLUENCE_GROUP %in% seq(0,25,1) ~'Lowest',
+                               AFFLUENCE_GROUP %in% seq(26,50,1) ~ 'Second',
+                               AFFLUENCE_GROUP %in% seq(51,75,1) ~ 'Third',
+                               AFFLUENCE_GROUP %in% seq(76,100,1) ~ 'Highes'))
+
+# Now for comorbitities
+
+# Creating a dataframe specifying the total number of diseases a person has accumulated until baseline
+
+multimorb <- multimorbidity_data %>% 
+  group_by(PERSON_ID) %>% 
+  summarise(Total_Number_Morb = sum(n())) %>% 
+  ungroup()
+
+# Merging cormorbidities into the pop new data frame 
+
+pop_new3 <- pop_new2 %>% 
+  left_join(multimorb, by = 'PERSON_ID')
+
+# Let's replace NAs with zeros!
+pop_new3 <- pop_new3 %>% 
+  replace_na(list(Total_Number_Morb = 0))
+
+# Making comorbidities as a factor variable
+
+pop_new3 <- pop_new3 %>%   
+  mutate(Multimorb_Group = case_when(Total_Number_Morb == 0 ~ 'Zero',
+                                     Total_Number_Morb == 1 ~ 'One',
+                                     Total_Number_Morb == 2 ~ 'Two',
+                                     Total_Number_Morb == 3 ~ 'Three',
+                                     Total_Number_Morb >= 4 ~ 'Four or more'))
+```
+
+## **Propensity score matching**
+
+```{r}
+# In this section, I will begin the propensity score matching procedure
+# This is done to:
+- "1. Match bereaved with non-bereaved (balancing covarites)"
+- "2. Start bereavement/time0 at the same time (creating common follow-up time)"
+
+# Viewing the initial imbalance 
+# No matching; constructing a pre-match matchit object
+
+match0 <- matchit(Bereavement_Status ~ 
+                    Age_Group_Start + 
+                    Sex + 
+                    Immigration_Status + 
+                    Children_Group + 
+                    Affluence_Group_New + 
+                    Multimorb_Group, data = 
+                    pop_new3, method = NULL, distance = "glm")
+
+summary(pop_new3$Immigration_Status)
+
+# Checking balance prior to matching
+
+summary(match0)
+
+# Propensity score matching
+# Exact macthing on age and sex with a ratio of 1:20
+
+match1 <- matchit(Bereavement_Status ~ 
+                    Age_Group_Start + 
+                    Sex + 
+                    Immigration_Status + 
+                    Children_Group + 
+                    Affluence_Group_New + 
+                    Multimorb_Group, data = 
+                    pop_new3, method = "nearest", distance = "glm", replace = F,
+                    ratio = 20, exact = ~ Age_Group_Start + Sex)
+
+summary(match1)
+
+# Distribution of propensity score
+plot(match1, type = "jitter", interactive = FALSE)
+
+# Density plot
+plot(match1, type = "density", interactive = FALSE, which.xs = ~ Age_Group_Start + Sex + Immigration_Status + Children_Group + Affluence_Group_New + Multimorb_Group)
+
+```
+
+### Evaluation of matching
+
+```{r}
+
+# Evaluating the matching procedure 
+
+matchingpsm_df <- match.data(match1)
+
+pop_new3 <- as.data.frame(pop_new3)
+
+matchingpsm_df <- as.data.frame(matchingpsm_df)
+
+matchingpsm_df1 <- bind_matches(pop_new3, match1)
+
+differencepsm <- tidy_smd(matchingpsm_df1, c(Age_Group_Start, Sex, Immigration_Status, Children_Group, Affluence_Group_New, Multimorb_Group), .group = Bereavement_Status,.wts = c(match1))
+
+
+# Inspect the matching using love_plot. 
+# Interpretation: The one line (in the plot - not shown here) shows the standardized distance in the original dataset whereas the other shows it in the matched dataset. The rule of thumb is that the distance should be under 0.10
+
+match_plot <- love_plot(differencepsm)
+
+match_plot
+
+```
+
+### **Merging the matched cohort into the dataframe**
+
+```{r}
+# Excluding individuals dead before index data and looking at the propensity score matching 
+# Only keep individuals alive at matched index date
+
+newdf <- matchingpsm_df %>%
+  group_by(subclass) %>%
+  mutate(Index_Date = (Bereavement_Date[Bereavement_Status==1])) %>%
+  ungroup()
+
+# Fake date of death/emmigration status after the study period stopped for the next code to work
+
+newdf <- newdf |> 
+  replace_na(list(Date_Of_Death = as.Date('2023-01-01'))) |>  
+  replace_na(list(Emigration_Date = as.Date('2023-01-01')))  
+  
+# Excluding individuals dead or emmigrated before index date
+
+sociodemo_df <- subset(newdf, Index_Date < Date_Of_Death & 
+                         Index_Date < Emigration_Date)
+```
+
+## Healthcare expenditures
+
+### Summary of all costs items
+
+```{r}
+# Summary for all cost items
+summary(costs_home_care21_data$COST)
+summary(costs_hospital_data$COST) #NA's
+summary(costs_lmdb21_data$COST) 
+summary(costs_residential21_data$COST)  
+summary(costs_sssy20_data$COST) #Negative values
+```
+
+### Creating a dataframe for healthcare expenditures
+
+```{r}
+# Here, I will tidy the costs items
+
+#The sssy dataframe for the primary health care data has negative values. I will only keep values of 0 or higher i.e. the negative values will be changed to 0. 
+
+costs_sssy20_data <- costs_sssy20_data |> 
+  mutate(COST = ifelse(COST <0, 0, COST))
+
+summary(costs_sssy20_data$COST)
+
+# No negative values
+
+# Replaceing NA's with zero's for hospital cost
+
+costs_hospital_data$COST[is.na(costs_hospital_data$COST)] <-0
+
+sum(is.na(costs_hospital_data))
+
+# Zero NA's
+
+# Dividing hospital cost into inpatient costs and outpatient costs
+# Hospital Costs (Inpatient):
+
+costs_inpatient <- costs_hospital_data %>% 
+  filter(SOURCE == 'DRGHEL') %>%
+  select(-SOURCE)
+
+# Hospital Costs(Outpatient):
+costs_outpatient <- costs_hospital_data %>%
+  filter(SOURCE == 'DRGAMB') %>%
+  select(-SOURCE)
+```
+
+### Computing time and costs variables
+
+```{r}
+# I continue by tidy the costs variables and computing time variables
+# First, I will rename all the 'cost variable names' for into more descriptive names
+
+# Inpatient variable
+costs_inpatient <- costs_inpatient |> 
+  rename(Inpatient_Costs = COST)
+
+# Outpatient variable
+costs_outpatient <- costs_outpatient |> 
+  rename(Outpatient_Costs = COST)
+
+# Home Care Cost
+costs_home_care21_data <- costs_home_care21_data |> 
+  rename(Home_Care_Costs = COST) 
+
+# Residential Costs
+costs_residential21_data <- costs_residential21_data |> 
+  rename(Residential_Costs = COST)
+
+# Prescription Drugs
+costs_lmdb21_data <- costs_lmdb21_data |> 
+  rename(Prescription_Costs = COST)
+
+# Primary Care Cost
+costs_sssy20_data <- costs_sssy20_data |> 
+  rename(Primary_Care_Costs = COST)
+
+# Now, I will make a variable with the date of the first day of the week for all weeks from 2011 to 2021
+
+Dates <-seq(as.Date('2011/01/01'),as.Date('2021/12/31'), by = 'week')
+
+Dates
+
+Dates <- as.data.frame(Dates)
+
+# Column with week number
+
+Dates <- Dates |> 
+  mutate(TIME = row_number()-1)
+
+# Now I will put the new dates variable into all expenditures dataframes 
+# inner_join(): only info that matches both dataframes
+
+costs_inpatient <- costs_inpatient |> 
+  inner_join(Dates, by = "TIME")
+
+costs_outpatient <- costs_outpatient |> 
+  inner_join(Dates, by = "TIME")
+
+costs_home_care21_data <- costs_home_care21_data |> 
+  inner_join(Dates, by = "TIME")
+
+costs_residential21_data <- costs_residential21_data |> 
+  inner_join(Dates, by = "TIME")
+
+costs_sssy20_data <- costs_sssy20_data |> 
+  inner_join(Dates, by = "TIME")
+
+costs_lmdb21_data <- costs_lmdb21_data |> 
+  inner_join(Dates, by = "TIME")
+
+
+# Now, I will fill in the weeks without information on expenditures with 0's so that all individuals have expenditures in the dataframe for the whole time period for all the different variables holding information on healthcare expenditures. 
+
+# :: is used to indicate use of specific packages. This is useful when a function is found in multiple packages and I want to use the specific function within this package (here tidyr).
+
+
+costs_inpatient <- tidyr::complete(costs_inpatient, PERSON_ID, 
+          Dates = seq(as.Date('2011-01-01'), as.Date('2021-12-31'), by = 'week'),            fill = list(Inpatient_Costs = 0))
+
+costs_outpatient <- tidyr::complete(costs_outpatient, PERSON_ID, 
+          Dates = seq(as.Date('2011-01-01'), as.Date('2021-12-31'), by = 'week'),            fill = list(Outpatient_Costs = 0)) 
+
+costs_home_care21_data <- tidyr::complete(costs_home_care21_data, PERSON_ID,
+          Dates = seq(as.Date('2011-01-01'), as.Date('2021-12-31'), by = 'week'),            fill = list(Home_Care_Costs = 0))
+
+costs_residential21_data <- tidyr::complete(costs_residential21_data, PERSON_ID,
+          Dates = seq(as.Date('2011-01-01'), as.Date('2021-12-31'), by = 'week'),            fill = list(Residential_Costs = 0)) 
+
+costs_sssy20_data <- tidyr::complete(costs_sssy20_data, PERSON_ID, 
+          Dates = seq(as.Date('2011-01-01'), as.Date('2021-12-31'), by = 'week'),            fill = list(Primary_Care_Costs = 0)) 
+
+costs_lmdb21_data <- tidyr::complete(costs_lmdb21_data, PERSON_ID, 
+          Dates = seq(as.Date('2011-01-01'), as.Date('2021-12-31'), by = 'week'),            fill = list(Prescription_Costs = 0)) 
+
+
+# Removing the 'TIME' variable for all dataframes since it is redundant. We will be using the dates indicating the beginning of the weeks and not the week numbers. 
+
+costs_inpatient <- costs_inpatient |> 
+  select(-TIME)
+
+costs_outpatient <- costs_outpatient |> 
+  select(-TIME)
+
+costs_home_care21_data <- costs_home_care21_data |> 
+  select(-TIME)
+
+costs_residential21_data <- costs_residential21_data |> 
+  select(-TIME)
+
+costs_sssy20_data <- costs_sssy20_data |> 
+  select(-TIME)
+
+costs_lmdb21_data <- costs_lmdb21_data |> 
+  select(-TIME)
+
+# We are only going to use data on expenditures before 2013, as we will investigate bereavement in 2012. As home care expenditures and residential expenditures is also our outcome of interest (to be computed), I will keep the old dataframe and create a new data frame with the expenditures before 2013
+
+costs_inpatient <- costs_inpatient |> 
+  filter(year(Dates) < 2014)
+
+costs_outpatient <- costs_outpatient |> 
+  filter(year(Dates) < 2014)
+
+costs_home_care21_data_bf2013 <- costs_home_care21_data |> 
+  filter(year(Dates) < 2014)
+
+costs_residential21_data_bf2013 <- costs_residential21_data |> 
+  filter(year(Dates) < 2014)
+
+costs_sssy20_data <- costs_sssy20_data |> 
+  filter(year(Dates) < 2014)
+
+costs_lmdb21_data <- costs_lmdb21_data  |> 
+  filter(year(Dates) < 2014)
+
+
+# Merging all dataframes with information on healthcare expenditures before 2013
+
+all_expenditures <- costs_inpatient |> 
+  full_join(costs_outpatient, by = c("PERSON_ID", "Dates")) |> 
+  full_join(costs_home_care21_data_bf2013, by = c("PERSON_ID", "Dates")) |> 
+  full_join(costs_residential21_data_bf2013, by = c("PERSON_ID", "Dates")) |>
+  full_join(costs_sssy20_data, by = c("PERSON_ID", "Dates")) |>
+  full_join(costs_lmdb21_data, by = c("PERSON_ID", "Dates")) 
+
+#head(all_expenditures, 1000) |> 
+  view()
+  
+# Replacing NAs
+
+all_expenditures <- all_expenditures |> 
+  replace_na(list(Inpatient_Costs = 0, Outpatient_Costs = 0, Home_Care_Costs = 0, 
+  Residential_Costs = 0, Prescription_Costs = 0, Primary_Care_Costs = 0))
+
+sum(is.na(all_expenditures))
+
+```
+
+### Merging dataframes with information on sociodemographics and healthcare expenditures
+
+```{r}
+# Full join the two dataframes
+
+long_df <- subset_df |> left_join(all_expenditures, by = c("PERSON_ID"))
+
+sum(is.na(long_df$Prescription_Costs))
+
+long_df <- long_df |> 
+  filter(!is.na(Prescription_Costs)) # Excluding NAs
+
+```
+
+### Calculating the weekly average for healthcare expenditures the year before the match index data
+
+```{r}
+# In this section, I will calculate the aggreagted weekly average for healthcare expenditures the year before the match index data
+
+# First, I calculate one year prior to bereavement
+
+long_df$One_Year_Prior <- long_df$Index_Date - years(1)
+
+# Because of leap year (29th of february 2012) there are NA's. I replace NA's in the one year prior with 28th of february 2011
+
+long_df <- long_df |> 
+  replace_na(list(One_Year_Prior = as_date("2011-02-28")))
+
+summary(long_df$One_Year_Prior)
+
+# I filter the dates one year before index date bereavement 
+
+long_df <- long_df |> 
+  group_by(PERSON_ID) |> 
+  filter(Dates >= One_Year_Prior & Dates < Index_Date) |> 
+  ungroup ()
+
+long_df <- long_df |> 
+  filter(Dates < Date_Of_Death)
+
+# I exclude individuals who die within a week after the matched index date (no information on the need for home care as this is obtained on a weekly basis) 
+
+long_df <- long_df |> 
+  filter(Date_Of_Death > Index_Date + days(7))
+
+# Now I calculate the averages 
+
+short_df <- long_df |> 
+  group_by(PERSON_ID) |> 
+  mutate(Average_Inpatient = mean(Inpatient_Costs)) |> 
+  mutate(Average_Outpatient = mean(Outpatient_Costs)) |> 
+  mutate(Average_Home_Care = mean(Home_Care_Costs)) |> 
+  mutate(Average_Residential = mean(Residential_Costs)) |> 
+  mutate(Average_Primary_Care = mean(Primary_Care_Costs)) |> 
+  mutate(Average_Prescription = mean(Prescription_Costs)) |> 
+  select(- Inpatient_Costs, - Outpatient_Costs, - Home_Care_Costs,
+         -Residential_Costs, - Primary_Care_Costs, -Prescription_Costs) |> 
+  ungroup()
+
+head(short_df, 1000) |> 
+  view()
+
+# I also construct a variable containing all healthcare expenditures on average
+
+short_df <- short_df |> 
+  mutate(Average_HCE_All = (Average_Inpatient + Average_Outpatient +
+                                Average_Home_Care + Average_Residential +
+                                 Average_Primary_Care + Average_Prescription))
+
+summary(short_df$Average_HCE_All)
+
+
+# Restricting the average home care costs values to be between 0-1 (this is done for visualization - the variable is strongly right skrewed)
+
+short_df <- short_df |>
+  mutate(Average_Home_Care = ifelse(Average_Home_Care >1, 1, Average_Home_Care))
+
+summary(short_df$Average_Home_Care)
+
+# Remove duplicated PERSON IDs
+
+short_df <- short_df |> 
+  filter(!duplicated(PERSON_ID))
+
+```
+
+## Outcome variable - need for home care
+
+```{r}
+# In this section, I construct the outcome variable "need for home care during one year follow-up since the matched index date" and tidy dataframe
+
+# Merging healthcare expenditures into new dataframe
+
+long_df_new <- subset_df |> 
+  left_join(all_expenditures, by = c("PERSON_ID"))
+
+# Excluding NAs
+
+sum(is.na(long_df_new$Prescription_Costs))
+
+long_df_new <- long_df_new |> 
+  filter(!is.na(Prescription_Costs)) 
+
+long_df_new$One_Year_After <- long_df_new$Index_Date + years(1)
+
+# Replacing NAs (leap year)
+
+long_df_new <- long_df_new |> 
+  replace_na(list(One_Year_After = as_date("2013-02-28")))
+
+summary(long_df_new$One_Year_After)
+
+# Filter the dates one year after index date bereavment 
+
+long_df_new <- long_df_new |> 
+  group_by(PERSON_ID) |> 
+  filter(Dates >= Index_Date & Dates <= One_Year_After) |> 
+  ungroup()
+
+# Keep only dates before date of death
+
+long_df_new <- long_df_new |> 
+  filter(Dates < Date_Of_Death)
+
+# Keep only individuals with 'date of death' at least after a week of the index date (we)
+
+long_df_new <- long_df_new |> 
+  filter(Date_Of_Death > Index_Date + days(7))
+
+# Average
+
+short_df_new <- long_df_new |> 
+  group_by(PERSON_ID) |> 
+  mutate(Average_Home_Care = mean(Home_Care_Costs)) |> 
+  mutate(Average_Residential = mean(Residential_Costs)) |> 
+  mutate(Home_Care_Res = Average_Home_Care + Average_Residential) |> 
+  select(Home_Care_Res, Average_Home_Care, Average_Residential, PERSON_ID) |>
+  ungroup()
+
+head(short_df_new, 1000) |> 
+  view()
+
+# Filter duplicated PERSON-IDs
+
+short_df_new <- short_df_new |> 
+  filter(!duplicated(PERSON_ID))
+
+# Creating a binary outcome variable no home care need (0) versus home care need (1)
+
+short_df_new <- short_df_new |>
+  mutate(Home_Care_Need = ifelse(Home_Care_Res >0, 1, 0))
+
+short_df_new |> janitor::tabyl(Home_Care_Need)
+
+short_df_new$Home_Care_Need <- as.factor(short_df_new$Home_Care_Need)
+
+# Now I add the Home_Care_Need variable to my original short_df dataframe
+
+short_df$Home_Care_Need <- short_df_new$Home_Care_Need
+
+```
+
+## Check balance in the final dataframe
+
+```{r}
+# Here I check the balance of the final dataframe - I have not matched on expenditures as this could only be done after the matching procedure was done
+
+differencepsm_new <- tidy_smd(short_df, c(Age_Group_Start, Sex, Immigration_Status, Children_Group, Affluence_Group_New, Multimorb_Group), .group = Bereavement_Status)
+
+# Inspect the matching using this plot. Again, the one line in the plot (not shown here) shows the standardized distance in the original dataset whereas the other shows it in the matched dataset. The rule of thumb is that the distance should be under 0.10
+
+match_plot_final <- love_plot(differencepsm_new)
+
+match_plot_final <- match_plot_final + 
+  theme_minimal() + 
+  theme(legend.position = "topleft") + 
+  labs(y = NULL,title = "Pooled Sex Analysis")
+```
+
+## Subgroup
+
+```{r}
+# I am also interested to investigate spousal bereavement and the need for home care for individuals without any pre-exisiting need for home care (aggregated weekly average of residential and home care expenditures above 0 before the match index date)
+
+# Here I build a dataframe where I exclude individuals with home care need before the matched index data
+
+# I create a variable that contains both the information about the average home care cost and residential expenditures and filter - hence creating af dataframe without individuals with pre-existing needs
+
+short_df_without <- short_df |> 
+  group_by(PERSON_ID) |> 
+  filter(Average_Home_Care == 0 & Average_Residential == 0) |> 
+  ungroup()
+
+summary(short_df_without$Average_Primary_Care)
+
+```
+
+### Tidy variables before modelling part
+
+```{r}
+# Make Sex variable as a binary variable (might be of use for some models that do not handle factors)
+
+short_df$Sex2 <- ifelse(short_df$Sex == 'Males', 0, 1)
+
+short_df_without$Sex2 <- ifelse(short_df_without$Sex == 'Males', 0, 1)
+```
+
+## Descriptive Statistics
+
+```{r}
+# Summary statistics
+
+summary(utable(Bereavement_Status ~ Home_Care_Need +
+                 Age_Group_Start + 
+                 Sex +
+                 Immigration_Status +
+                 Children_Group + 
+                 Affluence_Group_New + 
+                 Multimorb_Group +
+                 Average_Inpatient + 
+                 Average_Outpatient +
+                 Average_Home_Care + 
+                 Average_Residential +
+                 Average_Primary_Care + 
+                 Average_Prescription +
+                 Average_HCE_All, data= short_df, show.totals = F))
+
+summary(utable(Bereavement_Status ~ Home_Care_Need +
+                 Age_Group_Start + 
+                 Sex +
+                 Immigration_Status +
+                 Children_Group + 
+                 Affluence_Group_New + 
+                 Multimorb_Group +
+                 Average_Inpatient + 
+                 Average_Outpatient +
+                 Average_Home_Care + 
+                 Average_Residential +
+                 Average_Primary_Care + 
+                 Average_Prescription +
+                 Average_HCE_All, data= short_df_without, show.totals = F))
+
+
+
+# Summary statistics: healthcare expenditures
+# (NB: right skewed)
+summary(short_df$Average_Inpatient)
+summary(short_df$Average_Outpatient)
+summary(short_df$Average_Home_Care)
+summary(short_df$Average_Residential)
+summary(short_df$Average_Primary_Care)
+summary(short_df$Average_Prescription)
+summary(short_df$Average_HCE_All)
+```
+
+## Causal inference
+
+### Average bereavement effect
+
+```{r}
+# In this section, I want to investigate the average treatment effect (average bereavement effect) on the need for home care.
+
+# Estimating of the average bereavement effect using the ate function. I adjust for covariates that are not equally distributed across strata (informed by the love_plot)
+
+abe_model <- glm(Home_Care_Need ~ Bereavement_Status + Children_Group +formula = 
+                   Age_Group_Start + Average_HCE_All, data = short_df, family = 
+                   "binomial", x = T, y = T)
+
+abe_ate <- ate(abe_model, treatment = "Bereavement_Status",data = short_df)
+
+# Absolute risk
+
+summary(abe_ate)
+
+# Risk ratio
+
+summary(abe_ate, type="ratio")
+
+# Sex-stratified analysis: Average Bereavement Effect
+
+short_df_males <- short_df |> 
+  filter(Sex == "Males") |> 
+  select(-Sex)
+
+short_df_females <- short_df |> 
+  filter(Sex == "Females") |> 
+  select(-Sex)
+
+# Inital balance check 
+
+differencepsm_males <- tidy_smd(short_df_males, c(Age_Group_Start,
+Immigration_Status, Children_Group, Affluence_Group_New, Multimorb_Group), .group = Bereavement_Status)
+
+differencepsm_females <- tidy_smd(short_df_females, c(Age_Group_Start, Immigration_Status, Children_Group, Affluence_Group_New, Multimorb_Group), .group = Bereavement_Status)
+
+
+# I inspect the matching using love_plot. The one line shows the standardized distance in the original dataset whereas the other shows it in the matched dataset. The rule of thumb is that the distance should be under 0.10
+
+match_plot_final_males <- love_plot(differencepsm_males)
+
+match_plot_final_males <- match_plot_final_males + 
+  theme_minimal() + 
+  theme(legend.position = "topleft") + 
+  labs(y = NULL, title = "Males")
+
+match_plot_final_females <- love_plot(differencepsm_females)
+
+match_plot_final_females <- match_plot_final_females + 
+  theme_minimal() + 
+  theme(legend.position = "topleft") + 
+  labs(y = NULL,title = "Females") 
+
+# Overall Matching Plot
+
+match_plot_final / (match_plot_final_males + match_plot_final_females)
+
+# ABE - males
+
+abe_model_males <- glm(Home_Care_Need ~ Bereavement_Status + Average_HCE_All, data = short_df_males, family = "binomial", x = T, y = T)
+
+abe_ate_males <- ate(abe_model_males, treatment = "Bereavement_Status",data = short_df_males)
+
+summary(abe_ate_males)
+
+summary(abe_ate_males, type = "ratio")
+
+# ABE - females
+
+abe_model_females <- glm(Home_Care_Need ~ Bereavement_Status + Average_HCE_All + Children_Group + Age_Group_Start, data = short_df_females, family = "binomial", x = T, y = T)
+
+abe_ate_females <- ate(abe_model_females, treatment = "Bereavement_Status",data = short_df_females)
+
+summary(abe_ate_females)
+
+summary(abe_ate_females, type = "ratio")
+```
+
+## Prognostic modelling
+
+### Split data
+
+```{r}
+# Full target population
+# First let's split the data into train and test-sets
+# A random seed is utilised to ensure reproducibility of the results
+
+set.seed(13)
+
+short_df_split <- initial_split(short_df)
+
+short_df_split 
+
+short_df_train <- training(short_df_split)
+
+short_df_test <- testing(short_df_split)
+
+# Now we will create a 5-fold cross-validated set which will be used for the fine-tuning of our hyperparameters for the XGBoost model using the data pool obainted from the population
+
+set.seed(5)
+
+short_df_folds <- vfold_cv(data = short_df_train,v = 5)
+
+# Subgroup population
+
+# Single split for the subgroup population
+# Once again, let's split the data into train and test-sets
+
+set.seed(11)
+
+short_df_split_without <- initial_split(short_df_without)
+
+short_df_split_without 
+
+short_df_train_without <- training(short_df_split_without)
+
+short_df_test_without <- testing(short_df_split_without)
+
+# Again we use cross-validation for the data pool obtained from the subgroup population
+
+set.seed(7)
+
+short_df_folds_without <- vfold_cv(data = short_df_train_without,v = 5)
+
+```
+
+## Comparing total, testing and training set
+
+```{r}
+# Comparing train, test and total split for the pool of data obtained from the full target population and subgroup target population
+
+# First, I construct two vectores for the full population and the subgroup population
+
+short_df_train$TRAIN <- "TRUE"
+short_df_test$TEST <- "TRUE" 
+
+df_table_look <- short_df_train |> 
+  full_join(short_df_test) |> 
+  mutate(TRAIN_TEST = case_when(TRAIN == "TRUE" ~ "TRAIN",
+                                TEST == "TRUE" ~ "TEST"))
+
+short_df_train_without$TRAIN <- "TRUE"
+short_df_test_without$TEST <- "TRUE" 
+
+df_table_look_without <- short_df_train_without |> 
+  full_join(short_df_test_without) |> 
+  mutate(TRAIN_TEST = case_when(TRAIN == "TRUE" ~ "TRAIN",
+                                TEST == "TRUE" ~ "TEST"))
+
+
+# Constructing a table 1 
+# Full target population population
+
+table_full_pop <- summary(utable(TRAIN_TEST ~ Bereavement_Status +
+                 Home_Care_Need +
+                 Age_Group_Start + 
+                 Sex +
+                 Immigration_Status +
+                 Children_Group + 
+                 Affluence_Group_New + 
+                 Multimorb_Group, data = df_table_look))
+
+                 
+# Subgroup target population
+                 
+table_subgroup <- summary(utable(TRAIN_TEST ~ Bereavement_Status + Home_Care_Need +
+                 Age_Group_Start + 
+                 Sex +
+                 Immigration_Status +
+                 Children_Group + 
+                 Affluence_Group_New + 
+                 Multimorb_Group, data = df_table_look_without))
+  
+
+# Calculation the percentilies 
+
+### Inpatient cost ###
+
+# Full population
+quantile(short_df$Average_Inpatient, probs=c(.05,.95))
+quantile(short_df_train$Average_Inpatient, probs=c(.05,.95))
+quantile(short_df_test$Average_Inpatient, probs=c(.05,.95))
+
+# Subgroup
+quantile(short_df_without$Average_Inpatient, probs=c(.05,.95))
+quantile(short_df_train_without$Average_Inpatient, probs=c(.05,.95))
+quantile(short_df_test_without$Average_Inpatient, probs=c(.05,.95))
+
+### Outpatient cost ###
+
+# Full population
+quantile(short_df$Average_Outpatient, probs=c(.05,.95))
+quantile(short_df_train$Average_Outpatient, probs=c(.05,.95))
+quantile(short_df_test$Average_Outpatient, probs=c(.05,.95))
+
+# Subgroup
+quantile(short_df_without$Average_Outpatinet, probs=c(.05,.95))
+quantile(short_df_train_without$Average_Outpatient, probs=c(.05,.95))
+quantile(short_df_test_without$Average_Outpatient, probs=c(.05,.95))
+
+### Primary care cost ###
+
+# Full population
+quantile(short_df$Average_Primary_Care, probs=c(.05,.95))
+quantile(short_df_train$Average_Primary_Care, probs=c(.05,.95))
+quantile(short_df_test$Average_Primary_Care, probs=c(.05,.95))
+
+# Subgroup
+quantile(short_df_without$Average_Primary_Care, probs=c(.05,.95))
+quantile(short_df_train_without$Average_Primary_Care, probs=c(.05,.95))
+quantile(short_df_test_without$Average_Primary_Care, probs=c(.05,.95))
+
+### Prescription costs ###
+
+# Full population
+quantile(short_df$Average_Prescription, probs=c(.05,.95))
+quantile(short_df_train$Average_Prescription, probs=c(.05,.95))
+quantile(short_df_test$Average_Prescription, probs=c(.05,.95))
+
+# Subgroup
+quantile(short_df_without$Average_Prescription, probs=c(.05,.95))
+quantile(short_df_train_without$Average_Prescription, probs=c(.05,.95))
+quantile(short_df_test_without$Average_Prescription, probs=c(.05,.95))
+
+### Home care cost ###
+
+# Full population
+quantile(short_df$Average_Home_Care, probs=c(.05,.95))
+quantile(short_df_train$Average_Home_Care, probs=c(.05,.95))
+quantile(short_df_test$Average_Home_Care, probs=c(.05,.95))
+
+### Residential cost ###
+
+# Full population
+quantile(short_df$Average_Home_Care, probs=c(.05,.95))
+quantile(short_df_train$Average_Home_Care, probs=c(.05,.95))
+quantile(short_df_test$Average_Home_Care, probs=c(.05,.95))
+```
+
+### Full target population
+
+```{r}
+"In the following sections, I will build prediction models trained and tested on data from the full target population. This is done to predict the need for home care during one year follow-up"
+"1. - A null model"
+"2. - A simple logistic regression model"
+"3. - A full logistic regression model with cubic splines"
+"4. - A XGBoost model"
+```
+
+#### Null model (Benchmark model)
+
+```{r}
+# The null model ignores predictor variables and predicts an average risk (intercept model)
+# Logistic regression on training data with no predictors included
+
+null_model <- glm(Home_Care_Need ~ 1, data = short_df_train, family = "binomial")
+
+publish(null_model, intercept=1)
+
+# Predicted risk in the test data
+
+short_df_test$Risk_Null <- predictRisk(null_model, newdata=short_df_test)
+
+# Checking that the results of the model does not depend on predictor variables
+
+short_df_test[1:5, c("Age_Group_Start", "Sex", "Bereavement_Status", "Risk_Null")]
+
+```
+
+#### Simple model
+
+```{r}
+# The general aim of including variables in the prediction model is to increase the prediction performance of the model. 
+# Here, I create a logistic regression model trained on the full population with the predictors age and sex included
+
+simple_model <- glm(Home_Care_Need ~ Age_Group_Start + Sex, data = short_df_train, family = "binomial")
+
+publish(simple_model, intercept=1)
+
+# Based on the simple LR model, I compute a risk prediction model which predicts the risk need for  home care conditional on included predictors using the testing set
+
+risk.hcn_simple <- predictRisk(simple_model, newdata=short_df_test)
+
+risk.hcn_simple
+
+```
+
+#### Full model
+
+```{r}
+# Now, I build a logstic regression model including all covariants and cubic splies to allow for non-linear relationships 
+
+dd1 <- datadist(short_df_train)
+
+options(datadist = "dd1")
+
+# Again, I train the model on the full population
+
+full_model <- lrm(Home_Care_Need ~ Age_Group_Start + 
+                 Bereavement_Status +
+                 Sex +
+                 Immigration_Status +
+                 Children_Group + 
+                 Affluence_Group_New + 
+                 Multimorb_Group +
+                 rcs(Average_Inpatient, 3) + 
+                 rcs(Average_Outpatient,3) +
+                 rcs(Average_Home_Care, 3) + 
+                 rcs(Average_Residential, 3) +
+                 rcs(Average_Primary_Care, 3) + 
+                 rcs(Average_Prescription, 3),
+                 data = short_df_train, x = T, y = T)
+
+publish(full_model, intercept=1)
+
+# The testing set obtained from the full target population is again used to predict risk of need of home care given the set of predictors
+
+risk.hcn_full <- predictRisk(full_model, newdata = short_df_test)
+
+risk.hcn_full
+
+```
+
+#### XGBoost model
+
+```{r}
+# Next model is Extreme Gradient Boosting (XGBoost) with all predictors for predicting the one-year need for home care since the matched index data for the full population
+
+# Build recipe
+
+xg_rec <- recipe(Home_Care_Need ~ Age_Group_Start + 
+                 Bereavement_Status +
+                 Sex +
+                 Immigration_Status +
+                 Children_Group + 
+                 Affluence_Group_New + 
+                 Multimorb_Group +
+                 Average_Inpatient + 
+                 Average_Outpatient +
+                 Average_Home_Care + 
+                 Average_Residential +
+                 Average_Primary_Care + 
+                 Average_Prescription,
+                 data = short_df_train) |> 
+  step_dummy(all_nominal_predictors(),one_hot = T)
+                     
+                    
+# Let’s tune across possible hyperparameter configurations using our training set (with a subset that is held back for early stopping) plus our validation.
+# Cross-validations split for tuning hyper-parameters (done above)
+
+xgb_spec <-
+  boost_tree(
+    trees = tune(), 
+    mtry = tune(), 
+    min_n = tune(),
+    tree_depth = tune(),
+    stop_iter = tune(), 
+    learn_rate = tune()
+  ) %>%
+  set_engine("xgboost",validation = 0.2) %>%
+  set_mode("classification")
+
+xgb_wf <- workflow(xg_rec, xgb_spec)
+xgb_wf
+
+
+# Now, I run a race anova to find out the best hyperparameter configuration
+# Tune_race_anova() computes a set of performance metrics (e.g. accuracy or RMSE) for a pre-defined set of tuning parameters that correspond to a model or recipe across one or more resamples of the data. After an initial number of resamples have been evaluated, the process eliminates tuning parameter combinations that are unlikely to be the best results using a repeated measure ANOVA model.
+
+doParallel::registerDoParallel()
+set.seed(3) 
+
+xgb_rs <-
+  tune_race_anova(
+    xgb_wf, 
+    short_df_folds,
+    metrics = metric_set(brier_class),
+    grid = 30,
+    control = control_race(verbose_elim = TRUE)
+  )
+
+
+# I plot the race to visualize the results
+
+plot_race(xgb_rs)
+
+# I show the best grid of hyperparameters
+
+show_best(xgb_rs)
+
+# I finalize our workflow using the best combination of hyperparameters based on brier_class metric (a performance metrics combining the models calibration and discrimination abilities)
+
+xgb_last <- xgb_wf %>% 
+  finalize_workflow(select_best(xgb_rs, 'brier_class')) %>% 
+  last_fit(short_df_split)
+
+# Collect metrics
+
+xgb_last %>% collect_metrics()
+
+# Collect predictions
+
+xgb_last %>% collect_predictions()
+
+# Calibration plot
+
+tidymodels_prefer()
+
+xgb_last |> probably::cal_plot_logistic()
+
+# Let's now group the predictions   
+
+xgb_full_preds <- xgb_last$.predictions
+
+xgb_full_preds <- xgb_full_preds[[1]][2]
+
+xgb_full_preds <- as.matrix(xgb_full_preds)
+
+# Evaluate Performance on the testing set using riskregression's package function Score
+
+full_score <- Score(list('Xgboost' = xgb_full_preds),formula = Home_Care_Need ~ 1, data = short_df_test, summary = 'ipa',
+                    plots = 'calibration', metrics = c('AUC','brier'), se.fit = T, 
+                    seed = 9) #changed from 0
+
+summary(full_score)
+
+plotCalibration(full_score,round = F,rug = F)
+```
+
+#### Evaluation the models
+
+```{r}
+# Now, I compare all rival models using AUC, Brier score, IPA, and calibration plots. This is done using the predicted risk from the test set
+
+all_model_score <- Score(object = list("Null Model" = null_model,
+                                        "Simple Model" = simple_model, 
+                                        "Xgboost"= xgb_full_preds,
+                                        "Full Model" = full_model),
+                            formula = Home_Care_Need ~ 1,
+                            data = short_df_test,
+                            metrics = c("auc","brier"),
+                            summary = "IPA",
+                            plots = "cal",se.fit = T)
+
+all_model_score
+
+plotCalibration(all_model_score, round = T, models = c("Xgboost", "Full Model", "Simple Model"),legend = F)
+
+# The XGBoost model outperform all alternative models
+```
+
+### Subgroup target population
+
+```{r}
+"In the following sections, I will build prediction models trained and tested on data from the subgroup target population - restricted to individuals without any pre-existing needs. This is done to predict the need for home care during one year follow-up"
+"1. - A null model"
+"2. - A simple logistic regression model"
+"3. - A full logistic regression model with cubic splines"
+"4. - A XGBoost model
+```
+
+#### Null model (Benchmark model)
+
+```{r}
+# Model that ignores predictor variables and predicts an average risk
+# Logistic regression model trained on the subgroup 
+
+null_model_without <- glm(Home_Care_Need ~ 1, data = short_df_train_without, family = "binomial")
+
+publish(null_model_without, intercept=1)
+
+# Predicted risk obtained from the test data
+
+short_df_test_without$Risk_Null <- predictRisk(null_model_without, newdata=short_df_test_without)
+
+# Results does not depend on predictor variables
+
+short_df_test_without[1:5, c("Age_Group_Start", "Sex", "Bereavement_Status", "Risk_Null")]
+```
+
+#### Simple model
+
+```{r}
+# The general aim of including variables in the prediction model is to increase the prediction performance of the model. 
+# Here, I create a logistic regression model trained on the subgroup population with the predictors age and sex included
+
+simple_model_without <- glm(Home_Care_Need ~ Age_Group_Start + Sex2, data = short_df_train_without, family = "binomial")
+
+publish(simple_model_without, intercept=1)
+
+# Based on the simple LR model, I compute a risk prediction model which predicts the risk of home care need given the set of included predictors
+
+simple_model_without <- glm(Home_Care_Need ~ Age_Group_Start + Sex2, data = short_df_train_without, family = "binomial") 
+
+risk.hcn_simple_without <- predictRisk(simple_model_without, newdata=short_df_test_without)
+
+risk.hcn_simple_without
+```
+
+#### Full model
+
+```{r}
+# Again, I build a logstic regression model including all covariants and cubic splies to allow for non-linear relationships. This is done using the training set from the subgroup population
+
+dd <- datadist(short_df_train_without)
+options(datadist = "dd")
+
+full_model_without <- lrm(Home_Care_Need ~ Age_Group_Start + 
+                 Bereavement_Status +
+                 Sex2 +
+                 Immigration_Status +
+                 Children_Group + 
+                 Affluence_Group_New + 
+                 Multimorb_Group +
+                 rcs(Average_Inpatient, 3) + 
+                 rcs(Average_Outpatient, 3) +
+                 rcs(Average_Primary_Care, 3) + 
+                 rcs(Average_Prescription, 3),
+                 data = short_df_train_without, x = T, y = T)
+
+# Based on the full LR model, I compute a risk prediction model which predicts the risk of home care need given the set of included predictors
+
+risk.hcn_full_without <- predictRisk(full_model_without, newdata = short_df_test_without)
+
+publish(full_model_without, intercept=1)
+
+risk.hcn_full_without
+
+```
+
+#### XGBoost model
+
+```{r}
+# Next model is Extreme Gradient Boosting (XGBoost) with all predictors for predicting the one-year need for home care since the matched index data for the subgroup population
+
+# Build recipe
+
+xg_rec_without <- recipe(Home_Care_Need ~ Age_Group_Start + 
+                 Bereavement_Status +
+                 Sex2 +
+                 Immigration_Status +
+                 Children_Group + 
+                 Affluence_Group_New + 
+                 Multimorb_Group +
+                 Average_Inpatient + 
+                 Average_Outpatient +
+                 Average_Primary_Care + 
+                 Average_Prescription,
+                 data = short_df_train_without) |> 
+  step_dummy(all_nominal_predictors(),one_hot = T)
+                     
+                    
+# Let’s tune across possible hyperparameter configurations using our training set (with a subset that is held back for early stopping) plus our validation.
+# Cross-validations split for tuning hyper-parameters (done above)
+
+xgb_spec_without <-
+  boost_tree(
+    trees = tune(), 
+    mtry = tune(), 
+    min_n = tune(),
+    tree_depth = tune(),
+    stop_iter = tune(), 
+    learn_rate = tune()
+  ) %>%
+  set_engine("xgboost",validation = 0.2) %>%
+  set_mode("classification")
+
+xgb_wf_without <- workflow(xg_rec_without, xgb_spec_without)
+
+xgb_wf_without
+
+# Run a race anova to find out the best hyperparameter configuration
+# Tune_race_anova() computes a set of performance metrics (e.g. accuracy or RMSE) for a pre-defined set of tuning parameters that correspond to a model or recipe across one or more resamples of the data. After an initial number of resamples have been evaluated, the process eliminates tuning parameter combinations that are unlikely to be the best results using a repeated measure ANOVA model.
+
+doParallel::registerDoParallel()
+
+set.seed(26) 
+
+xgb_rs_without <-
+  tune_race_anova(
+    xgb_wf, 
+    short_df_folds,
+    metrics = metric_set(brier_class),
+    grid = 30,
+    control = control_race(verbose_elim = TRUE)
+  )
+
+# We plot the race to visualize the results
+
+plot_race(xgb_rs_without)
+
+# We show the best grid of hyperparameters
+
+show_best(xgb_rs_without)
+
+# We finalize our workflow using the best combination of hyperparameters based on brier_score metrics
+
+xgb_last_without <- xgb_wf_without %>% 
+  finalize_workflow(select_best(xgb_rs_without, 'brier_class')) %>% 
+  last_fit(short_df_split_without)
+
+# Collect metrics
+
+xgb_last_without %>% collect_metrics()
+
+# Collect predictions
+
+xgb_last_without %>% collect_predictions()
+
+
+# Let's now group the predictions   
+
+xgb_full_preds_without <- xgb_last_without$.predictions
+
+xgb_full_preds_without <- xgb_full_preds_without[[1]][2]
+
+xgb_full_preds_without <- as.matrix(xgb_full_preds_without)
+
+# Evaluate Performance on testing set using riskregression's package function Score
+
+full_score_without <- Score(list('Xgboost' = xgb_full_preds_without),formula = Home_Care_Need ~ 1, data = short_df_test_without, summary = 'ipa',
+                    plots = 'calibration', metrics = c('AUC','brier'), se.fit = T, seed = 27)
+
+summary(full_score_without)
+
+plotCalibration(full_score,round = F,rug = F)
+
+```
+
+#### Evaluation of the models
+
+```{r}
+# Now, I compare all rival models using AUC, Brier score, IPA, and calibration plots. This is done using the predicted risk from the test set
+
+all_model_score_without <- Score(object = list("Null Model" = null_model_without,
+                                        "Simple Model" = simple_model_without, 
+                                        'Xgboost' = xgb_full_preds_without,
+                                        "Full Model" = full_model_without),
+                            formula = Home_Care_Need ~ 1,
+                            data = short_df_test_without,
+                            metrics = c("auc","brier"),
+                            summary = "IPA",
+                            plots = "cal",se.fit = T)
+
+all_model_score_without
+
+plotCalibration(all_model_score_without, round = T, models = c("Xgboost", "Full Model", "Simple Model"), legend = T)
+
+# There is slightly evidence that the XGBoost model is the better alternative
+```
+
+## Crude risk predictions for the full target population
+
+```{r}
+# In this section, I will plot crude risk predictions for the full target population by each cost item. This is done in a sex stratified analysis. 
+
+# Compute a variable with color codes
+# Blue: non-bereaved
+# Pink: bereaved
+
+l_color <- c("#0087FB", "#FD0060")
+
+############ CURE RELATED EXP #################
+
+# Expenditures, sex diffrences
+
+risk_inpatient <- short_df_test |> 
+                ggplot(aes(x = Average_Inpatient, y = xgb_full_preds, 
+                        fill=Bereavement_Status, colour = Bereavement_Status)) +
+                        geom_smooth(show.legend =F) +
+                        facet_wrap(vars(Sex))+
+                        theme_minimal(base_size = 14) +
+                        scale_color_manual(values = l_color) + 
+                        scale_fill_manual(values = l_color) +  
+                theme(strip.text=element_text(size=14)) +
+                        xlab("Weekly average hospital inpatient expenditures") +
+                        ylab("Predicted risk of being in need of home care ") +
+                        scale_x_continuous(limits = c(0, 1)) + 
+                        scale_y_continuous(limits = c(0,1))
+
+
+risk_outpatient <- short_df_test |> 
+                ggplot(aes(x = Average_Outpatient, y = xgb_full_preds, 
+                        fill = Bereavement_Status, colour = Bereavement_Status)) +
+                        geom_smooth(show.legend =F) +
+                        facet_wrap(vars(Sex))+
+                        theme_minimal(base_size = 14) +
+                theme(strip.text=element_text(size=14))+
+                        scale_color_manual(values = l_color)+ 
+                        scale_fill_manual(values = l_color)+  
+                        xlab("Weekly average hospital outpatient expenditures") +
+                        ylab("Predicted risk of being in need of home care") +
+                        scale_x_continuous(limits = c(0, 1)) +
+                        scale_y_continuous(limits = c(0, 1))
+
+
+risk_prescription <- short_df_test |> 
+                ggplot(aes(x = Average_Prescription, y = xgb_full_preds, 
+                        fill=Bereavement_Status, colour = Bereavement_Status)) +
+                        geom_smooth(show.legend = F) +
+                        acet_wrap(vars(Sex))+
+                        theme_minimal(base_size = 14) +
+                theme(strip.text=element_text(size=14))+
+                        scale_color_manual(values = l_color)+ 
+                        scale_fill_manual(values = l_color)+  
+                        xlab("Weekly average prescription expenditures") +
+                        ylab(label = "Predicted risk of being in need of home care") +
+                        scale_x_continuous(limits = c(0, 1)) +
+                        scale_y_continuous(limits = c(0, 1))
+
+
+risk_primary_care <- short_df_test |> 
+               mutate(xgb_full_preds = if_else(xgb_full_preds > 0.70, 0.70,xgb_full_preds)) |> 
+               ggplot(aes(x = Average_Primary_Care, y = xgb_full_preds, 
+                         fill=Bereavement_Status, colour =  
+                      risk_primary_careBereavement_Status)) + 
+                      geom_smooth(show.legend = F,level = 0.90,method = "gam") +
+                      facet_wrap(vars(Sex))+
+                      theme_minimal(base_size = 14) +
+               theme(strip.text=element_text(size=14)) +
+                      scale_color_manual(values = l_color) + 
+                      scale_fill_manual(values = l_color) +  
+                      xlab("Weekly average hospital primary care expenditures") +
+                      ylab(label = "Predicted risk of being in need of home care") +
+                      scale_x_continuous(limits = c(0, 1))
+                      scale_y_continuous(limits = c(0, 1))
+
+############ CARE RELATED EXP #################
+
+risk_homecare <- short_df_test |> 
+              mutate(xgb_full_preds = if_else(xgb_full_preds > 0.8, 0.8,xgb_full_preds)) |> 
+              ggplot(aes(x = Average_Home_Care, y = xgb_full_preds, 
+                      fill=Bereavement_Status, colour = Bereavement_Status)) +
+                      geom_smooth(show.legend = F) +
+                      facet_wrap(vars(Sex))+
+                      theme_minimal(base_size = 14) +
+             theme(strip.text=element_text(size=14))+
+                      scale_color_manual(values = l_color)+ 
+                      scale_fill_manual(values = l_color)+  
+                      xlab("Weekly average home care expenditures") +
+                      ylab(label = "Predicted risk of being in need of home care") +
+                      scale_x_continuous(limits = c(0, 1)) +
+                      scale_y_continuous(limits = c(0,1))
+
+
+risk_residential <- short_df_test |> 
+             mutate(xgb_full_preds = if_else(xgb_full_preds > 0.7, 0.7,xgb_full_preds)) |> 
+             ggplot(aes(x = Average_Residential, y = xgb_full_preds, 
+                      fill=Bereavement_Status, colour = Bereavement_Status)) +
+                      geom_smooth(show.legend = F) +
+                      facet_wrap(vars(Sex))+
+                      theme_minimal(base_size = 14) +
+             theme(strip.text=element_text(size=14))+
+                      scale_color_manual(values = l_color)+ 
+                      scale_fill_manual(values = l_color)+  
+                      xlab("Weekly average residential expenditures") +
+                      ylab(label = "Predicted risk of being in need of home care") +
+                      scale_x_continuous(limits = c(0, 10)) +
+                      scale_y_continuous(limits = c(0,1))
+
+```
+
+## Crude risk prediction for the subgroup target population
+
+```{r}
+# Now, I will plot crude risk predictions for the subgroup target population by each cost item. This is done in a sex stratified analysis. 
+
+# Compute a variable with color codes
+# Blue: non-bereaved
+# Pink: bereaved
+
+############ CURE RELATED EXP #################
+
+risk_inpatient_wo <- short_df_test_without |> mutate(xgb_full_preds_without = if_else(xgb_full_preds_without > 0.7, 0.7,    xgb_full_preds_without)) |> 
+                ggplot(aes(x = Average_Inpatient, y = xgb_full_preds_without, 
+                        fill=Bereavement_Status, colour = Bereavement_Status)) +
+                        geom_smooth(show.legend =F) +
+                        facet_wrap(vars(Sex))+
+                        theme_minimal(base_size = 14) +
+                theme(strip.text=element_text(size=14))+
+                        scale_color_manual(values = l_color)+ 
+                        scale_fill_manual(values = l_color)+  
+                        xlab("Weekly average hospital inpatient expenditurea") +
+                        ylab("Predicted risk of being in need of home care") +
+                        scale_x_continuous(limits = c(0, 1)) +
+                        scale_y_continuous(limits = c(0, 1))
+
+
+risk_outpatient_wo <- short_df_test_without |> 
+                ggplot(aes(x = Average_Outpatient, y = xgb_full_preds_without, 
+                        fill=Bereavement_Status, colour = Bereavement_Status)) +
+                        geom_smooth(show.legend =F) +
+                        facet_wrap(vars(Sex))+
+                        theme_minimal(base_size = 14) +
+                theme(strip.text=element_text(size=14))+
+                        scale_color_manual(values = l_color)+ 
+                        scale_fill_manual(values = l_color)+  
+                        xlab("Weekly average hospital outpatient expenditures") +
+                        ylab("Predicted risk of being in need of home care") +
+                        scale_x_continuous(limits = c(0, 1)) +
+                        scale_y_continuous(limits = c(0, 1)) 
+
+
+risk_primary_care_wo <- short_df_test_without |> 
+                ggplot(aes(x = Average_Primary_Care, y = xgb_full_preds_without, 
+                        fill=Bereavement_Status, colour = Bereavement_Status)) +
+                        geom_smooth(show.legend = F) +
+                        facet_wrap(vars(Sex)) +
+                        theme_minimal(base_size = 14) +
+                theme(strip.text=element_text(size=14))+
+                        scale_color_manual(values = l_color)+ 
+                        scale_fill_manual(values = l_color)+  
+                        xlab("Weekly average hospital primary care expenditures") +
+                        ylab(label = "Predicted risk of being in need of home care") +
+                        scale_x_continuous(limits = c(0, 1)) +
+                        scale_y_continuous(limits = c(0, 1))
+
+
+risk_prescription_wo <- short_df_test_without |> 
+                ggplot(aes(x = Average_Prescription, y = xgb_full_preds_without, 
+                        fill=Bereavement_Status, colour = Bereavement_Status)) +
+                        geom_smooth(show.legend = F) +
+                        facet_wrap(vars(Sex))+
+                        theme_minimal(base_size = 14) +
+               theme(strip.text=element_text(size=14)) +
+                        scale_color_manual(values = l_color) + 
+                        scale_fill_manual(values = l_color) +  
+                        xlab("Weekly average prescription expenditures") +
+                        ylab(label = "Predicted risk of being in need of home care") +
+                        scale_x_continuous(limits = c(0, 1)) +
+                        scale_y_continuous(limits = c(0, 1))
+
+```
+
+## Shapley values
+
+```{r}
+# In this section, I explore each feature importances to the XGBoost model output. This is done by using Shapley values
+
+# First, I exact the model so we can use the shapviz package
+
+xgb_last_shapley <- extract_workflow(xgb_last) |> 
+  fit(short_df_train) |> 
+  extract_fit_engine() 
+
+xgb_last_explain <- extract_workflow(xgb_last) |> 
+  fit(short_df_train)
+
+# Now I calculate the shapley values and plot them using a beeswarm plot
+
+set.seed(15)
+
+xgb_shapley_full <- shapviz(object = xgb_last_shapley,
+                            X_pred = bake(prep(xg_rec),new_data = NULL, has_role
+                                          ("predictor"),composition = "matrix"))
+
+xgb_shapley_full$S <- -xgb_shapley_full$S
+
+sv_importance(xgb_shapley_full,kind = "bar")
+
+sv_importance(xgb_shapley_full,kind = "beeswarm")
+
+xgb_shapley_full_explain <- explain(xgb_last_explain,data = short_df_train |>
+                                      select(-Home_Care_Need),y = short_df_train |>
+                                      select(Home_Care_Need) |> mutate
+                                      (Home_Care_Need = if_else(Home_Care_Need ==
+                                      "1",1,0)),label = "XGBoost Full"
+                                      ,predict_function_target_column = 1)
+
+sv_importance(xgb_shapley_full, kind = "beeswarm")
+  
+
+# Subgroup target population
+
+# Exact model so we can use the shapviz package
+
+xgb_last_shapley_without <- extract_workflow(xgb_last_without) |> 
+  fit(short_df_train_without) |> 
+  extract_fit_engine() 
+
+xgb_last_explain_without <- extract_workflow(xgb_last_without) |> 
+  fit(short_df_train_without)
+
+# Now I calculate the shapley values and plot them using a beeswarm plot
+
+set.seed(47)
+
+xgb_shapley_without <- shapviz(object = xgb_last_shapley_without,
+                            X_pred = bake(prep(xg_rec),new_data = NULL, has_role
+                                          ("predictor"),composition = "matrix"))
+
+xgb_shapley_full_without$S <- -xgb_shapley_full_without$S
+
+sv_importance(xgb_shapley_full_without, kind = "bar")
+
+sv_importance(xgb_shapley_full_without, kind = "beeswarm")
+
+xgb_shapley_full_explain_without <- explain(xgb_last_explain_without ,data =
+                                        short_df_train_without |> 
+                                        select(-Home_Care_Need),y = 
+                                        short_df_train |> select(Home_Care_Need)|>
+                                        mutate(Home_Care_Need = ifelse
+                                        (Home_Care_Need == "1",1,0)),label =
+                                        "XGBoost Full",
+                                        predict_function_target_column = 1)
+
+sv_importance(xgb_shapley_full, kind = "beeswarm")
+
+```
