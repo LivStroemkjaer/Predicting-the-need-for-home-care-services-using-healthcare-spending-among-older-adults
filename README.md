@@ -1,6 +1,6 @@
 # Predicting the need for home care services using healthcare spending among older, spousal bereaved adults 
 
-Predicting the need for home care services using healthcare spending among older, spousal bereaved adults 
+## Predicting the need for home care services using healthcare spending among older, spousal bereaved adults 
 
 This project is my master thesis in Public Health Science from the Univerisity of Copenhagen
 
